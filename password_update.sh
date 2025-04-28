@@ -106,9 +106,32 @@ if [[ ! -z "$PORT_INPUT" ]]; then
     SSH_PORT=$PORT_INPUT
 fi
 
+# Read servers into an array - this ensures we process all servers
+mapfile -t SERVERS < "$SERVER_LIST"
+
+# Filter out empty lines and comments
+VALID_SERVERS=()
+for server in "${SERVERS[@]}"; do
+    # Skip empty lines and comments
+    if [[ -n "$server" && ! "$server" =~ ^[[:space:]]*# ]]; then
+        VALID_SERVERS+=("$server")
+    fi
+done
+
 # Count servers
-SERVER_COUNT=$(wc -l < "$SERVER_LIST")
+SERVER_COUNT=${#VALID_SERVERS[@]}
+if [[ $SERVER_COUNT -eq 0 ]]; then
+    echo -e "${RED}Error: No valid server IPs found in $SERVER_LIST.${NC}"
+    exit 1
+fi
+
 echo -e "\n${BLUE}Ready to update password for user ${YELLOW}$TARGET_USER${BLUE} on ${YELLOW}$SERVER_COUNT${BLUE} servers.${NC}"
+
+# List servers for confirmation
+echo -e "\nServers to process:"
+for server in "${VALID_SERVERS[@]}"; do
+    echo -e "  - ${YELLOW}$server${NC}"
+done
 
 # Confirm before proceeding
 read -p "Proceed with password update? (y/n): " CONFIRM
@@ -125,24 +148,29 @@ update_password() {
     # Create password change command - uses chpasswd which is more secure than echo to passwd
     PASSWORD_COMMAND="echo '$TARGET_USER:$NEW_PASS' | sudo -S chpasswd"
     
+    # Temporary file for error output
+    local error_file=$(mktemp)
+    
     # Execute command via SSH
     if [[ "$USE_KEY" == "y" || "$USE_KEY" == "Y" ]]; then
         # Using SSH key
-        ssh $SSH_OPTS -p $SSH_PORT -i "$SSH_KEY" $SSH_USER@$server "$PASSWORD_COMMAND" 2>/tmp/ssh_error
+        ssh $SSH_OPTS -p $SSH_PORT -i "$SSH_KEY" $SSH_USER@$server "$PASSWORD_COMMAND" 2>"$error_file"
     else
         # Using password
-        $SSH_AUTH ssh $SSH_OPTS -p $SSH_PORT $SSH_USER@$server "$PASSWORD_COMMAND" 2>/tmp/ssh_error
+        $SSH_AUTH ssh $SSH_OPTS -p $SSH_PORT $SSH_USER@$server "$PASSWORD_COMMAND" 2>"$error_file"
     fi
     
     # Check result
     SSH_RESULT=$?
     if [[ $SSH_RESULT -eq 0 ]]; then
         echo -e "${GREEN}✓ Password successfully updated on $server${NC}"
+        rm -f "$error_file"
         return 0
     else
-        ERROR=$(cat /tmp/ssh_error)
+        ERROR=$(cat "$error_file")
         echo -e "${RED}✗ Failed to update password on $server${NC}"
         echo -e "${RED}  Error: $ERROR${NC}"
+        rm -f "$error_file"
         return 1
     fi
 }
@@ -154,19 +182,15 @@ SUCCESS_COUNT=0
 FAILED_COUNT=0
 FAILED_SERVERS=""
 
-# Loop through each server
-while IFS= read -r server || [[ -n "$server" ]]; do
-    # Skip empty lines and comments
-    [[ -z "$server" || "$server" =~ ^# ]] && continue
-    
-    # Update password on the server
+# Loop through each server in the array
+for server in "${VALID_SERVERS[@]}"; do
     if update_password "$server"; then
         ((SUCCESS_COUNT++))
     else
         ((FAILED_COUNT++))
         FAILED_SERVERS="$FAILED_SERVERS\n  - $server"
     fi
-done < "$SERVER_LIST"
+done
 
 # Print summary
 echo -e "\n${BLUE}========== SUMMARY ==========${NC}"
@@ -178,8 +202,5 @@ if [[ $FAILED_COUNT -gt 0 ]]; then
 fi
 
 echo -e "\n${BLUE}Password update completed.${NC}"
-
-# Clean up
-rm -f /tmp/ssh_error
 
 exit 0
